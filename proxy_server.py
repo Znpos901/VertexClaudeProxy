@@ -3,6 +3,7 @@ import os
 import sys
 import random
 from typing import Optional, Dict, Any
+import itertools
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -40,8 +41,19 @@ region = os.getenv('REGION')
 password = os.getenv('PASSWORD')
 debug_mode = os.getenv('DEBUG', 'False').lower() == 'true'
 
+# 新增：从 .env 文件中读取对话轮数
+switch_after_rounds = int(os.getenv('SWITCH_AFTER_ROUNDS', 0))
+
+# 新增：用于跟踪当前使用的 project_id 和对话轮数
+current_project_index = 0
+conversation_count = 0
+
+# 新增：循环迭代器，用于循环选择 project_id
+project_cycle = itertools.cycle(project_ids)
+
 #负载均衡选择器
 def load_balance_selector():
+    global current_project_index, conversation_count
     default_auth_file = os.path.join(os.path.join(get_base_path(), 'auth'), 'auth.json')
 
     # 检查是否存在 auth.json
@@ -49,8 +61,15 @@ def load_balance_selector():
         # 如果存在 auth.json，返回第一个 project_id 和 auth.json
         return project_ids[0], default_auth_file
     else:
-        # 如果不存在 auth.json，随机选择一个项目
-        project_id = random.choice(project_ids)
+        # 如果不存在 auth.json，使用循环选择器
+        if switch_after_rounds > 0:
+            if conversation_count >= switch_after_rounds:
+                current_project_index = (current_project_index + 1) % len(project_ids)
+                conversation_count = 0
+            project_id = project_ids[current_project_index]
+        else:
+            project_id = next(project_cycle)
+        
         auth_file = os.path.join(os.path.join(get_base_path(), 'auth'), f'{project_id}.json')
         if not os.path.exists(auth_file):
             # 如果文件不存在，抛出 HTTPException
@@ -58,6 +77,11 @@ def load_balance_selector():
                 status_code=500,
                 detail="No valid authentication file found. Please check your configuration."
             )
+        
+        # 新增：打印当前使用的 project_id 和地区
+        print(f"当前使用的 GCP Project ID: {project_id}")
+        print(f"当前使用的地区: {region}")
+        
         return project_id, auth_file
 
 #根据验证文件取得token
@@ -97,6 +121,7 @@ def check_auth(api_key: Optional[str]) -> bool:
 
 @app.post("/v1/messages")
 async def proxy_request(request: Request, x_api_key: Optional[str] = Header(None)):
+    global conversation_count
     if not check_auth(x_api_key):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -107,6 +132,8 @@ async def proxy_request(request: Request, x_api_key: Optional[str] = Header(None
         
         try:
             project_id, auth_file = load_balance_selector()
+            # 新增：增加对话轮数计数
+            conversation_count += 1
         except HTTPException as e:
             print(f"未找到关联的验证文件，请检查配置。")
             return JSONResponse(status_code=500, content=error_detail("internal_error", str(e)))
